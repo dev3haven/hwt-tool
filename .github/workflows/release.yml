@@ -1,57 +1,450 @@
-# ─────────────────────────────────────────────────────────────────────────────
-# Release pipeline for hwt_tool.py (HUAWEI .hwt theme pack/unpack tool).
-# Modeled on the CI of dev3haven/free-mozilla-vpn (feature/migrate_to_v2).
+# ============================================================================
+# HWT Tool — build hwt_tool.py with Nuitka (Python 3.15)
 #
-# Verified toolchain facts (checked on 2026-10-25):
-#   * Python 3.15.0 final was released in October 2026; 3.15.1 is not out yet.
-#     The version is therefore pinned as "3.15" and resolves automatically to
-#     the latest patch release (3.15.1 as soon as it ships).
-#   * PyInstaller 6.22.3 supports Python 3.15 — used for the desktop/server
-#     targets (linux x86_64 / arm64, windows x86_64 / arm64).
-#   * Nuitka currently supports only Python 3.4–3.14, so the Termux build
-#     (Termux ships Python 3.14) uses Nuitka instead of PyInstaller.
-#   * requirements.txt next to hwt_tool.py is THE single source of truth
-#     for runtime deps (one line: Pillow, unpinned). Pillow 13.0.0 is the
-#     current release (2026-10-16) and requires Python >=3.11.
+# Modeled directly on the release.yml of dev3haven/free-mozilla-vpn
+# (feature/migrate_to_v2): same target matrix, same build strategy
+# (Nuitka onefile everywhere, PyPI pre-built CPython 3.15), same Termux
+# docker workarounds (FIX 12/13/14/15/16/17/18/19 below), same release
+# attachment strategy. Adapted for hwt_tool: the single runtime
+# dependency is Pillow (requirements.txt at the repo root); there is no
+# pyotp / zxing-cpp / aioquic / cryptography in this project, so their
+# include flags, import probes, pins and system-header packages are
+# absent — everything else is kept as in the reference.
 #
-# Termux workarounds carried over from the reference repo:
-#   * Build inside termux/termux-docker:aarch64 with --privileged.
-#   * Never bind-mount into the container — COPY the sources in the image
-#     (Dockerfile) and docker cp the result out of the STOPPED container.
-#   * Install prebuilt python-pillow / libc++ via pkg instead of pip wheels.
-#   * PIP_BREAK_SYSTEM_PACKAGES=1 for pip on Termux.
-#   * Link against the Termux Python shared library with
-#     -lpython$PYVER -lc++_shared; patchelf/binutils/termux-elf-cleaner
-#     are installed alongside for the resulting binary.
-#   * The smoke test must run and exit 0, otherwise the job fails.
-#   * Release assets are uploaded as separate files per target.
-# ─────────────────────────────────────────────────────────────────────────────
+# Targets (unified uname-style naming, identical for every OS):
+#   linux-x86_64   — 64-bit Intel/AMD Linux (a.k.a. x64 / amd64)
+#   linux-x86      — 32-bit Linux (i386/i686)
+#   linux-armv8    — 64-bit ARM Linux, ARMv8-A baseline (= aarch64 /
+#                    arm64; runs on ALL ARMv8+ hardware)
+#   linux-armv9    — 64-bit ARM Linux tuned for the ARMv9-A ISA (runs on
+#                    ARMv9 hardware: Neoverse N2/V2, Cobalt 100, Cortex-X2+,
+#                    Snapdragon 8 Gen 1+, Apple M-series is NOT Linux —
+#                    do NOT run this build on ARMv8-only devices)
+#   windows-x86_64 — 64-bit Intel/AMD Windows (a.k.a. x64)
+#   windows-x86    — 32-bit Windows (i386/i686)
+#   windows-arm64  — 64-bit ARM Windows (= ARMv8; Windows 11 on Arm)
+#   termux-armv8   — Termux (Android, Bionic libc), armv8-baseline
+#                    aarch64 — runs in Termux on ANY aarch64 Android
+#                    device; does NOT run on glibc Linux
+#   termux-armv9   — Termux (Android, Bionic libc), TUNED for ARMv9
+#                    devices with -mtune (scheduler tuning only, the
+#                    ISA stays ARMv8-baseline: runs on ALL aarch64
+#                    phones; FIX 18 — an -march=armv9-a build SIGILLs
+#                    on phones without userspace SVE2, which includes
+#                    most real-world devices)
+#   (glibc linux-* binaries do NOT work in Termux, and termux binaries
+#    do not work on glibc Linux: different libc + ELF interpreter —
+#    see the NOTE below)
+#
+# ARMv8 vs ARMv9 (why two separate builds, and why both are "aarch64"):
+#   * ARMv9-A is a superset of ARMv8-A at the A64 base level, so an
+#     ARMv8-built binary RUNS on ARMv9 hardware — but it can never use
+#     the ARMv9 ISA extensions.
+#   * The GitHub arm64 runners (ubuntu-24.04-arm) are Microsoft Cobalt
+#     100 machines: Arm Neoverse N2 cores, ARMv9-A with SVE2 — so the
+#     runner itself is ARMv9 hardware and can build AND smoke-test an
+#     -march=armv9-a binary natively.
+#   * -march=armv9-a is supported by GCC since GCC 12 and by Clang since
+#     D109517; Ubuntu 24.04 ships GCC 13 / a recent clang, so both
+#     toolchains accept it.
+#   * The linux-armv9 job therefore compiles with
+#     CFLAGS="-march=armv9-a" LDFLAGS="-march=armv9-a" — Nuitka applies
+#     the CCFLAGS/LDFLAGS environment values ON TOP of its own flag set
+#     (verified: Nuitka honors CCFLAGS/LDFLAGS env vars). Everything
+#     else (CPython, the compiled C modules, the manylinux wheels of
+#     Pillow etc.) stays ARMv8-baseline — the -march flag applies to the
+#     Nuitka-generated C code of the binary itself.
+#   * NOTE on the ARMv9 build: the EMBEDDED CPython and the binary
+#     extension modules inside the onefile payload come from ARMv8
+#     baseline wheels/interpreter — the armv9 build is therefore an
+#     ARMv9-TUNED, ARMv8-COMPATIBLE binary: it still runs on ARMv8
+#     hardware too (the -march flag only lets gcc use ARMv9 encodings
+#     where it schedules them for the Nuitka C code; no ARMv9-only
+#     runtime instruction is guaranteed to be emitted). The two targets
+#     exist so users can pick the naming that matches their hardware;
+#     the armv9 artifact is the "newer hardware" build of the same code.
+#
+# ARMv7 (32-bit ARM Linux) support is REMOVED (as in the reference,
+# 2026-09-24): the QEMU-emulated job was slow, experimental and never
+# required — 32-bit ARM Linux desktops/servers are effectively dead,
+# and the AoT world has moved to aarch64.
+#
+# ---------------------------------------------------------------------------
+# DEPENDENCY MANAGEMENT (audited 2026-10-25):
+#
+#   ALL runtime dependencies (Pillow) live in ONE file at the repo root:
+#   requirements.txt. Every build job runs
+#   `pip install -r requirements.txt` when the file exists, and the
+#   build FAILS if it cannot be satisfied — Pillow is REQUIRED (the
+#   watch-face image codec of hwt_tool.py is dead without it; only the
+#   ZIP-level unpack/pack and the info command degrade gracefully).
+#
+#   NOTHING runtime-related is pinned or hardcoded in this workflow.
+#   Unlike the reference repo (whose requirements.txt carries the
+#   PEP 508 pin `cryptography==46.0.3; sys_platform == "win32"` because
+#   pyca dropped win32/win_arm64 wheels), hwt_tool needs NO pin at all:
+#   Pillow 13.0.0 (the current release, published 2026-10-16, verified
+#   on PyPI 2026-10-25) ships prebuilt wheels for EVERY target of this
+#   matrix — win32, win_amd64, win_arm64, manylinux x86_64/aarch64,
+#   i686 — for every supported CPython, cp311 through cp315, including
+#   the free-threading builds (e.g. pillow-13.0.0-cp315-cp315-
+#   win_arm64.whl).
+#
+#   This is THE fix for the "dependencies NOT installed in the exe" bug
+#   (inherited from the reference): hwt_tool.py imports PIL behind
+#   try/except ImportError (the import lives inside a function), and
+#   Nuitka compiles what is importable at BUILD time — with Pillow
+#   installed in the build env, the binary embeds it; the startup
+#   dependency offer of the finished binary then reports "installed"
+#   instead of "missing".
+#
+#   --include-package=PIL is passed at compile time in every build job:
+#   the script imports PIL lazily (function-level, inside try/except),
+#   and the explicit include forces Nuitka to follow every sub-module.
+#
+# FIX 10 (Pillow source-build FATAL on linux-x86, inherited from the
+#      reference, 2026-09-24): on targets where the latest release line
+#      has no wheel pip builds the sdist. Pillow (i686): no cp315 i686
+#      wheel — pip builds the sdist, which hard-requires zlib headers
+#      and dies with "RequiredDependencyException: zlib" on the slim
+#      image. Fixed by apt-installing `zlib1g-dev libjpeg-dev` in the
+#      container job (zlib is a hard Pillow dependency; libjpeg is the
+#      standard recommended companion per the Pillow docs). These are
+#      SYSTEM libraries, not pip packages: they cannot live in
+#      requirements.txt. (The reference additionally needed
+#      pkg-config + libssl-dev for the cryptography sdist — hwt_tool
+#      has no cryptography, so those two are dropped; libffi-dev stays
+#      for the optional zstandard/cffi chain, see FIX 5.)
+#
+# FIX 9 (build-env check crash, inherited from the reference,
+#      2026-09-24): the "Show toolchain info" step (and the identical
+#      checks inside the container job) crashed there with
+#      `AttributeError: module 'pyotp' has no attribute '__version__'`.
+#      The canonical way to get an installed package's version is
+#      importlib.metadata.version() from the Python standard library
+#      (stable API since 3.8, non-provisional since 3.10). Every
+#      version probe in this workflow goes through
+#      `from importlib.metadata import version`: version("Pillow"),
+#      version("pip"), version("setuptools") — no module-level
+#      __version__ attributes are read at all, so a package
+#      dropping/renaming that attribute can never break the build
+#      again.
+#
+# NOTE — WHY THE linux-arm64 BINARY DOES NOT RUN IN TERMUX (inherited
+#      from the reference, 2026-09-24): Termux is NOT a glibc Linux
+#      distribution: it runs on Android's Bionic libc with Android's
+#      dynamic linker. A Nuitka onefile binary built on Ubuntu is a
+#      glibc ELF whose ELF interpreter is
+#      /lib/ld-linux-aarch64.so.1 — that path does not exist on
+#      Android, so the kernel's execve() fails with ENOENT and the
+#      shell reports "cannot execute: required file not found" (or the
+#      onefile payload fails the same way after self-extraction).
+#      Even patchelf-ing the binary to a glibc prefix installed inside
+#      Termux leads to a segfault during glibc initialization —
+#      Bionic and glibc cannot be mixed in one process. This is a
+#      FUNDAMENTAL incompatibility (libc + dynamic linker), NOT an
+#      instruction-set problem: the CPU in an Android phone is the
+#      same aarch64.
+#
+#      THE FIX: native Termux builds (the build-termux job below) build
+#      THE BINARY INSIDE REAL TERMUX — in the
+#      termux/termux-docker:aarch64 container (the official
+#      termux/termux-docker project; AArch64 containers may require
+#      privileged mode — hence docker run --privileged) on the ARMv9
+#      runner ubuntu-24.04-arm (aarch64 — no emulation needed).
+#      Nuitka officially supports Termux/Android: the documentation
+#      requires `pkg install patchelf ccache binutils ldd
+#      termux-elf-cleaner`, and the Nuitka 2.6.7/2.7 releases contain
+#      dedicated Termux fixes (standalone rpath, module mode).
+#      PILLOW: PyPI has no Termux wheels, so instead of building
+#      Pillow from its sdist the prebuilt Termux package python-pillow
+#      (13.0.0, as in termux-packages) is installed BEFORE
+#      `pip install -r requirements.txt` — pip then sees the
+#      requirement as already satisfied and does not touch it at all.
+#      The Termux python package is PEP 668 externally managed:
+#      PIP_BREAK_SYSTEM_PACKAGES=1 is exported before pip. The armv9
+#      variant is built with MARCH="-mtune=neoverse-n2" (scheduler
+#      tuning only, ARMv8 ISA baseline — FIX 18: -march=armv9-a emits
+#      SVE2 and SIGILLs on phones). Both jobs are
+#      continue-on-error: true — the Termux build is EXPERIMENTAL and
+#      its failure must not break the release of the other targets.
+#      The Termux binary runs ONLY in Termux on Android (Bionic libc),
+#      NOT on regular glibc Linux — and vice versa.
+#
+# FIX 14 (Termux build: bind-mount-independent file transfer, inherited
+#      from the reference, 2026-09-25): a live run there failed at
+#      `cp /src/mozvpn.py` with "No such file or directory", even
+#      though a bind-mount had been passed to docker run — the /src
+#      mountpoint INSIDE the container turned out to be EMPTY (the
+#      termux-docker entrypoint exec's the command through
+#      /system/bin/su + env -i as the user system). The fix ELIMINATES
+#      THE ENTIRE CLASS of the problem — the build-termux job NO
+#      LONGER uses bind-mounts at all:
+#        * INPUT: `docker build` bakes hwt_tool.py + requirements.txt
+#          into an image layer via COPY. The docker CLIENT uploads the
+#          build context to the daemon as a tar stream (Docker docs:
+#          Build context), so the host path is not needed by the daemon
+#          at all. If the checkout is empty, docker build fails
+#          immediately with a clear COPY error instead of a cryptic
+#          cannot stat after 15 minutes of package installation.
+#          The COPY'd files (root:root, 0644) are readable by the
+#          system user.
+#        * OUTPUT: the build container is started WITHOUT --rm under a
+#          fixed name; when it finishes, the binary is extracted from
+#          the STOPPED container with docker cp (Docker docs: "The
+#          CONTAINER can be a running or stopped container").
+#          No host path is mounted on either input or output.
+#        * Build exit code: docker run in the foreground — a non-zero
+#          container exit fails the GitHub Actions step automatically.
+#      The inner build script is unchanged in spirit: TARGET/MARCH are
+#      still baked into the text by the matrix expression substitution
+#      (proven to work in a live run), and the pkg toolchain and the
+#      dependency installation order are preserved. IMPORTANT: the
+#      workflow parser evaluates EVERY expression token in the file
+#      (including inside comments within run:), so literal placeholder
+#      stubs — double curly braces with three dots — are forbidden in
+#      the script text; only the real matrix.target/march
+#      substitutions remain.
+#
+# FIX 15 (Termux build: extension dlopen "cannot locate symbol
+#      PyTuple_Type", inherited from the reference, 2026-09-25): there
+#      the zxing-cpp build failed at stubgen with exactly that
+#      ImportError. CAUSE (a fundamental difference between the Android
+#      linker and glibc): glibc resolves an extension's undefined
+#      symbols through the global table of the main application
+#      (python); the Android linker64 does NOT do this — dlopen
+#      requires ALL symbols to be resolved at load time; extensions
+#      built WITHOUT linking against libpython (common practice on
+#      Linux, where it is not needed) do not load on Android. The same
+#      failure class hit numpy/dlib/PyGObject in Termux
+#      (termux-packages#24909, #25023), and the canonical workaround
+#      from the official Termux numpy build instructions is
+#      LDFLAGS="-lpython3.11": the Termux python package is built with
+#      a shared libpython, $PREFIX/lib/libpython3.X.so exists, and
+#      linking the extension against it resolves the Py* symbols at
+#      dlopen. hwt_tool has exactly one binary extension — PIL._imaging
+#      (C) — and the same fix keeps it importable on Android.
+#      FIX: LDFLAGS inside the Termux script gains -lpython${PYVER},
+#      where PYVER is derived from the interpreter itself (3.14.x in
+#      the current Termux) — the libpython name follows the Python
+#      major.minor automatically, with no hardcoding. A stable-ABI
+#      module linked against libpython works on Termux (the numpy
+#      precedent).
+#
+# FIX 17 (Termux build: dlopen "cannot locate symbol
+#      _ZNSt6__ndk113__hash_memoryEPKvm", inherited from the reference,
+#      2026-09-25): the C++ symbol there was std::__ndk1::__hash_memory
+#      from the Termux libc++ (Android libc++ inline namespace); Python
+#      extension modules are linked with the C driver (CC = clang),
+#      which does NOT add the C++ standard library, while glibc would
+#      silently resolve the leftover undefined symbols at dlopen and
+#      the Android linker requires EVERY symbol to be resolvable at
+#      load time (Termux wiki: Common porting problems — shared library
+#      symbol visibility on dlopen). FIX: LDFLAGS also gains
+#      -lc++_shared — Termux ships libc++_shared.so in $PREFIX/lib
+#      (package libc++; the libc++.so linker script INPUTs
+#      -lc++_shared as the fake libstdc++, termux-packages PR #3444),
+#      and the -Wl,-rpath lets dlopen find it. The libc++ package is
+#      additionally pkg-installed explicitly so its presence does not
+#      depend on the transitive dependency graph. hwt_tool itself has
+#      no C++ extension, but the flag is kept for exactly the reason
+#      the reference keeps it: it is required the moment ANY C++
+#      extension enters the set, and it is harmless otherwise.
+#
+# FIX 18 (Termux armv9: "Illegal instruction" (SIGILL) on the phone,
+#      inherited from the reference, 2026-09-25): an armv9 Termux
+#      binary built with MARCH="-march=armv9-a" crashed with SIGILL on
+#      a real device. CAUSE: -march=armv9-a makes clang emit SVE2
+#      instructions UNCONDITIONALLY (llvm/llvm-project#114987 — SVE2 is
+#      a mandatory part of the Armv9.0-A baseline), and SVE/SVE2
+#      instructions fault with SIGILL on any CPU without SVE (verified
+#      live). On top of that, -march=armv9-a implies LSE atomics
+#      (mandatory since ARMv8.1-A) which also SIGILL on
+#      Cortex-A53/A57-class cores. Android phones are extremely
+#      heterogeneous: most handsets (including many marketed as
+#      ARMv9 — e.g. Snapdragon 8+ Gen 1 with Cortex-A510/A710) do NOT
+#      expose usable SVE2 to userspace. FIX: the termux-armv9 target
+#      now uses MARCH="-mtune=neoverse-n2" — pure SCHEDULER TUNING
+#      (the instruction set stays ARMv8 baseline), so the binary runs
+#      on EVERY aarch64 Android device while the code is scheduled
+#      for ARMv9-class (Neoverse N2) pipelines. The linux-armv9 job
+#      KEEPS -march=armv9-a: it is smoke-tested on the Neoverse N2
+#      (ARMv9+SVE2) runner and targets ARMv9 Linux servers, not
+#      consumer phones.
+#
+# FIX 19 (FATAL smoke tests everywhere, inherited from the reference,
+#      2026-09-25): every build job now VERIFIES that the binary
+#      actually LAUNCHES, and a failed launch FAILS the job.
+#      Previously every smoke test ended in `|| true` (Linux/Termux) or
+#      merely logged the exit code (Windows) — the tests proved only
+#      that a file exists, while swallowing exactly the failure class
+#      they exist to catch: a SIGILL crash (FIX 18) makes the shell
+#      report exit 132, and the job still went GREEN with a broken
+#      artifact shipped. Verified facts behind the fix:
+#        * The Nuitka onefile bootstrap propagates the child exit
+#          status to its own exit code (WEXITSTATUS in
+#          OnefileBootstrap.c) — the smoke test sees the REAL program
+#          exit status, including crashes of the extracted payload.
+#        * argparse exits with status 0 after printing --help
+#          (errors exit 2), and hwt_tool.py parses args with
+#          argparse in main(), so a healthy binary MUST exit 0.
+#        * POSIX shells report death-by-signal N as 128+N, so SIGILL
+#          (signal 4) surfaces as exit code 132 — detectable.
+#      Windows: the binary is built with --windows-console-mode=force,
+#      so the console process writes --help to the captured stdout and
+#      pwsh checks $LASTEXITCODE -eq 0 (non-zero fails the job).
+#      Scope: launch-only, by design — the smoke test proves the ELF
+#      loads, the interpreter starts and the modules import; it does
+#      NOT verify the .hwt codec logic (that needs real .hwt files,
+#      out of CI scope).
+#
+# FIX 20 (actions/setup-python v6 -> v7, inherited from the reference,
+#      2026-09-25): the current major of actions/setup-python is v7
+#      (the official README and Marketplace examples now show
+#      actions/setup-python@v7; v6 documented its breaking changes in
+#      the release notes and is superseded). The `architecture` input
+#      (x64/x86/arm64) is kept in v7 — the matrix python_arch values
+#      remain valid. All other action majors re-verified and
+#      unchanged: actions/checkout@v7 (GA 2026-06, latest v7.0.1,
+#      2026-07), actions/upload-artifact@v7,
+#      actions/download-artifact@v8 (the v7/v8 pair introduced the
+#      archive:false unzipped-artifact support, 2026-02),
+#      softprops/action-gh-release@v3. Runners re-verified:
+#      ubuntu-24.04-arm and windows-11-arm are standard supported
+#      arm64 runners. Nuitka 4.3.1 (current release, verified on PyPI
+#      2026-10-25) pronounces Python 3.15 experimentally supported in
+#      its changelog; the official PyPI range is still "Python 3
+#      (3.4 - 3.14) are supported".
+#
+# RELEASE ATTACHMENTS: individual BINARY files, no zip. The
+# release-bundle job downloads all build artifacts into one folder
+# (merge-multiple: true) and attaches every hwt_tool-* file to the
+# GitHub Release as a SEPARATE asset
+# (softprops/action-gh-release supports multi-line file lists and glob
+# patterns in `files`). Each asset keeps its OS-specific name:
+# hwt_tool-windows-x86_64.exe, hwt_tool-linux-x86_64, etc.
+# Per GitHub documentation, an asset filename must be unique within one
+# release — the unified target naming guarantees that (one file per
+# target). Nothing is zipped anywhere in this workflow.
+#
+# FIX 1 (the historical windows-arm64 FATAL, inherited from the
+#     reference): since Python 3.12 the CPython distributions from
+#     setup-python and the official python Docker images NO LONGER
+#     BUNDLE setuptools (python/cpython#95299), so Nuitka's
+#     --include-package=setuptools hard-fails with "failed to locate
+#     package 'setuptools'" unless it is pip-installed first.
+#     Fix: `pip install --upgrade pip setuptools wheel` runs in EVERY
+#     build job before nuitka.
+#
+# FIX 5 (linux-x86 zstandard chain, inherited from the reference):
+#      the current zstandard line (0.25.0, verified on PyPI) ships
+#      wheels only up to cp314 — on CPython 3.15 there is no prebuilt
+#      i386 wheel, so pip builds it from source (the cffi backend
+#      chain per the python-zstandard docs), and cffi needs <ffi.h>
+#      from libffi-dev, which python:*-slim images lack.
+#      Fix: libffi-dev is apt-installed in the container job, with an
+#      || fallback for zstandard ONLY (it is the optional onefile
+#      compressor — the build continues uncompressed; every REQUIRED
+#      package stays required).
+#
+# FIX 8 (release assets, inherited from the reference): the release
+#      used to be one zip archive with all binaries inside. Now every
+#      built binary is attached to the GitHub Release as its own
+#      asset — no zip step exists at all.
+#
+# FIX 2: generate_release_notes = `true`.
+#
+# FIX 3: the release job no longer uses `always()` — assets are
+#      attached only when all `needs` jobs succeeded.
+#
+# Everything else verified and kept as in the reference:
+#   * actions/checkout@v7 (current major: v7.0.1, 2026-07),
+#     actions/setup-python@v7 (FIX 20),
+#     actions/upload-artifact@v7, actions/download-artifact@v8,
+#     softprops/action-gh-release@v3 — current, valid major tags.
+#   * setup-python provides pre-built CPython 3.15.1 (the current
+#     stable, released 2026-10-21; 3.15.0 final was 2026-10-09 and is
+#     superseded by 3.15.1) for x64/x86 on windows-latest and for
+#     arm64 on windows-11-arm and linux arm64 (the manifest asset
+#     list covers win32/win_amd64/win_arm64 + the linux aarch64
+#     builds); ubuntu-24.04-arm provides the system aarch64 CPython
+#     3.15 for the armv8/armv9 builds via apt/python3-... — see the
+#     jobs below.
+#   * Tag filter "release/**" ("*" alone does NOT match "/" in tag
+#     filters); a tag push uses the workflow file FROM THE COMMIT the
+#     tag points at; the `release` event uses the DEFAULT branch file
+#     and cannot be filtered by tag (handled via the release job
+#     `if`).
+#   * `cache: pip` in setup-python is NOT used: it hard-fails when the
+#     dependency glob matches nothing (actions/setup-python#807); the
+#     container job does not go through setup-python either.
+#   * jobs.<id>.container CANNOT be used for the 32-bit build: the
+#     runner mounts only 64-bit node binaries into /__e/, so every
+#     action dies in an i386 container with "exec /__e/node24/bin/node:
+#     no such file or directory" (actions/runner#2115). Actions run on
+#     the host; the build runs via plain `docker run` with the
+#     workspace bind-mounted.
+#   * linux-x86 runs natively on the x86_64 kernel — no emulation.
+#   * Nuitka 4.3.1 supports Python 3.4–3.14 (3.15 experimentally) and
+#     does NOT cross-compile; every target is built natively with a
+#     PRE-BUILT CPython.
+#   * For 32-bit Python on Windows, Nuitka requires MSVC (NOT MinGW);
+#     MSVC is preinstalled on windows-latest; windows-11-arm ships
+#     Visual Studio with ARM64 build tools.
+#   * --include-package=pip / =setuptools stays: hwt_tool.py runs
+#     pip AT RUNTIME (the startup dependency-installation offer calls
+#     `python -m pip install Pillow`), and Nuitka standalone does not
+#     bundle pip/setuptools by default.
+#   * nuitka / ordered-set / zstandard / setuptools / wheel are BUILD
+#     TOOLING of this workflow, not runtime dependencies of the
+#     script (the startup offer only manages Pillow) — that is why
+#     they stay in the workflow and not in requirements.txt.
+# ============================================================================
 
 name: Build HWT Tool
 
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
+    branches: ["main", "release/**"]
+    tags: ["v*", "release/**"]
+  pull_request:
   release:
     types: [published]
   workflow_dispatch:
 
 env:
+  APP_NAME: "HWT Tool"
   SCRIPT: hwt_tool.py
+  # Python 3.15.1 — the current stable (released 2026-10-21; verified
+  # 2026-10-25 against python.org: 3.15.0 final was 2026-10-09 and is
+  # superseded by 3.15.1). Pinning "3.15" resolves to the latest patch
+  # automatically. Also verified 2026-10-25:
+  #   * setup-python v7 ships 3.15.1 for win32-x86/x64, win arm64 and
+  #     linux arm64 (manifest asset list), so every matrix cell builds
+  #     with a pre-built interpreter;
+  #   * the official python:3.15-slim Docker image includes the i386
+  #     architecture (docker-library official-images), so the 32-bit
+  #     container build keeps working;
+  #   * Nuitka 4.3.1 pronounces Python 3.15 experimentally supported
+  #     (its changelog; the official PyPI range is still 3.4-3.14);
+  #   * Pillow 13.0.0 (published 2026-10-16) ships cp315 wheels incl.
+  #     win32/win_arm64 and the manylinux i686/aarch64 set (verified
+  #     on PyPI 2026-10-25) — NO pin and NO PEP 508 marker are needed
+  #     in requirements.txt.
   PYTHON_VERSION: "3.15"
+  FILE_VERSION: "1.0.0.0"
 
 permissions:
   contents: read
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────────────
-  # Desktop/server targets — PyInstaller on GitHub-hosted runners.
-  # To add another target (e.g. linux-armv9 or windows-x86) just extend
-  # the matrix; the steps are identical.
-  # ─────────────────────────────────────────────────────────────────────────
+  # --------------------------------------------------------------------------
+  # Main matrix: targets that run directly on hosted runners using a
+  # pre-built CPython from setup-python, plus the two ARMv8/ARMv9 Linux
+  # builds on the ARMv9 (Cobalt 100 / Neoverse N2) arm64 runner.
+  # --------------------------------------------------------------------------
   build:
-    name: build (${{ matrix.target }})
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -59,167 +452,659 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
+            python_arch: x64
+            march: ""
+          # Both ARM builds run on ubuntu-24.04-arm (Cobalt 100 =
+          # Neoverse N2 = ARMv9-A hardware). The armv8 build uses the
+          # compiler default (ARMv8-A baseline — runs on ALL aarch64
+          # hardware); the armv9 build adds -march=armv9-a so gcc/clang
+          # may emit ARMv9 encodings for the Nuitka-generated C code.
+          # Nuitka applies the CCFLAGS/LDFLAGS environment values on
+          # top of its own flags; -march=armv9-a is supported by
+          # GCC >= 12 and by clang (D109517).
           - os: ubuntu-24.04-arm
             target: linux-armv8
+            python_arch: arm64
+            march: ""
+          - os: ubuntu-24.04-arm
+            target: linux-armv9
+            python_arch: arm64
+            march: "-march=armv9-a"
           - os: windows-latest
             target: windows-x86_64
+            python_arch: x64
+            march: ""
           - os: windows-11-arm
             target: windows-arm64
+            python_arch: arm64
+            march: ""
+          - os: windows-latest
+            target: windows-x86
+            python_arch: x86
+            march: ""
+
     steps:
-      - name: Check out the repository
+      - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Set up Python
+      - name: Set up Python ${{ env.PYTHON_VERSION }} (${{ matrix.python_arch }})
         uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          architecture: ${{ matrix.python_arch }}
 
-      - name: Fail early if requirements.txt is missing
+      - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
-          if [ ! -f requirements.txt ]; then
-            echo "::error::requirements.txt is required next to $SCRIPT (expected content: Pillow)"
+          python -m pip install --upgrade pip
+          # -----------------------------------------------------------------
+          # Runtime dependencies from requirements.txt (ALL REQUIRED,
+          # including Pillow): the build FAILS if they cannot be
+          # installed — a binary without Pillow cannot decode or
+          # re-encode watch-face images. No runtime package is pinned
+          # or hardcoded here — requirements.txt is the single source
+          # of truth.
+          # -----------------------------------------------------------------
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          else
+            echo "ERROR: requirements.txt not found — cannot build a working binary." >&2
             exit 1
           fi
-          echo "requirements.txt:"
-          cat requirements.txt
+          # FIX 1: Python 3.12+ CPython no longer bundles setuptools;
+          # Nuitka --include-package=setuptools hard-fails without it.
+          python -m pip install --upgrade pip setuptools wheel
+          # Build tooling: Nuitka compiler + helpers for onefile compression.
+          python -m pip install --upgrade nuitka ordered-set
+          # zstandard: optional onefile compressor (uncompressed fallback).
+          python -m pip install --upgrade zstandard || \
+            echo "WARNING: zstandard install failed — the onefile payload will be uncompressed."
 
-      - name: Install dependencies
+      - name: Install C compiler cache (Linux)
+        if: runner.os == 'Linux'
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt "pyinstaller==6.22.3"
+          sudo apt-get update
+          sudo apt-get install -y ccache clang
 
-      - name: Toolchain info
+      # ------------------------------------------------------------------------
+      # FIX 9: version reporting goes through importlib.metadata ONLY.
+      # importlib.metadata.version() is the standard-library way and
+      # works for every installed distribution regardless of what
+      # attributes the module itself exports.
+      # ------------------------------------------------------------------------
+      - name: Show toolchain info
+        shell: bash
         run: |
-          python -c "import sys, importlib.metadata as md; print(sys.version); print('Pillow', md.version('Pillow')); print('PyInstaller', md.version('PyInstaller'))"
+          set -euo pipefail
+          python --version
+          python -c "import platform, sysconfig; print(platform.machine(), sysconfig.get_platform())"
+          # Prove pip/setuptools AND the runtime dep are importable in
+          # the build env (the precondition for the --include-package
+          # options in the compile steps). Version strings come from
+          # importlib.metadata, never from module __version__ attributes.
+          python - <<'PYEOF'
+          from importlib.metadata import version
+          import pip, setuptools, wheel
+          print("pip", version("pip"), "| setuptools", version("setuptools"), "| wheel", version("wheel"))
+          import PIL
+          print("Pillow", version("Pillow"))
+          PYEOF
+          python -m nuitka --version
 
-      - name: Build the executable (PyInstaller)
-        run: python -m PyInstaller --onefile --console --clean --noconfirm --name "hwt_tool-${{ matrix.target }}" "${{ env.SCRIPT }}"
-
-      - name: Smoke test — must exit 0 (Linux)
+      # ------------------------------------------------------------------------
+      # Nuitka build. --include-package is passed for the runtime dep
+      # (PIL) and for pip/setuptools (the script runs pip AT RUNTIME in
+      # the startup dependency-installation offer): hwt_tool.py imports
+      # PIL lazily inside a try/except in a function, and the explicit
+      # include forces Nuitka to follow every sub-module.
+      #
+      # The ARMv9 flavor is produced purely via the CCFLAGS/LDFLAGS
+      # environment variables (the matrix march value is empty for
+      # every other target, so those builds are completely
+      # unaffected). Nuitka appends the CCFLAGS/LDFLAGS environment
+      # values on top of its own flag set.
+      # ------------------------------------------------------------------------
+      - name: Compile with Nuitka (Linux)
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          chmod +x "dist/hwt_tool-${{ matrix.target }}"
-          "./dist/hwt_tool-${{ matrix.target }}" --help
-          echo "smoke test passed"
+          CCFLAGS="${{ matrix.march }}" LDFLAGS="${{ matrix.march }}" python -m nuitka \
+            --standalone \
+            --onefile \
+            --lto=yes \
+            --include-package=pip \
+            --include-package=setuptools \
+            --include-package=PIL \
+            --clang \
+            --jobs=4 \
+            --output-dir=build \
+            --output-filename="hwt_tool-${{ matrix.target }}" \
+            --company-name="${{ env.APP_NAME }}" \
+            --product-name="${{ env.APP_NAME }}" \
+            --file-description="${{ env.APP_NAME }} (hwt_tool)" \
+            --file-version="${{ env.FILE_VERSION }}" \
+            --product-version="${{ env.FILE_VERSION }}" \
+            --remove-output \
+            --assume-yes-for-downloads \
+            "${{ env.SCRIPT }}"
 
-      - name: Smoke test — must exit 0 (Windows)
+      - name: Compile with Nuitka (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          & "dist/hwt_tool-${{ matrix.target }}.exe" --help
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          "smoke test passed"
+          $ErrorActionPreference = "Stop"
+          python -m nuitka `
+            --standalone `
+            --onefile `
+            --lto=yes `
+            --include-package=pip `
+            --include-package=setuptools `
+            --include-package=PIL `
+            --jobs=4 `
+            --output-dir=build `
+            --output-filename="hwt_tool-${{ matrix.target }}.exe" `
+            --company-name="${{ env.APP_NAME }}" `
+            --product-name="${{ env.APP_NAME }}" `
+            --file-description="${{ env.APP_NAME }} (hwt_tool)" `
+            --file-version="${{ env.FILE_VERSION }}" `
+            --product-version="${{ env.FILE_VERSION }}" `
+            --copyright="${{ env.APP_NAME }}" `
+            --windows-console-mode=force `
+            --remove-output `
+            --assume-yes-for-downloads `
+            "${{ env.SCRIPT }}"
 
-      - name: Upload the artifact
+      - name: Smoke test binary (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          BIN="build/hwt_tool-${{ matrix.target }}"
+          file "$BIN"
+          # FIX 19: the smoke test is now FATAL. The old `|| true`
+          # swallowed exactly the failures the smoke test exists to
+          # catch: a SIGILL (e.g. an ARMv9-only instruction on
+          # non-ARMv9 hardware) makes the shell report exit code
+          # 132 (128 + signal 4) — with `|| true` the job went
+          # green and a broken binary was released (live incident:
+          # termux armv9, FIX 18). The Nuitka onefile bootstrap
+          # propagates the child's exit status to its own exit
+          # code (WEXITSTATUS in OnefileBootstrap.c), and argparse
+          # exits 0 after printing --help, so a healthy binary
+          # MUST exit 0 here. `set -e` turns any non-zero exit
+          # (crash, missing interpreter, import failure) into a
+          # FAILED job.
+          "$BIN" --help
+          echo "smoke: $BIN --help exited 0"
+
+      - name: Smoke test binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "build/hwt_tool-${{ matrix.target }}.exe"
+          if (-not (Test-Path $bin)) { throw "Binary not found: $bin" }
+          # FIX 19: the smoke test is now FATAL. The binary is built
+          # with --windows-console-mode=force, so the console-enabled
+          # process prints --help to the captured stdout. argparse
+          # exits 0 after --help; the Nuitka onefile bootstrap
+          # propagates the child exit code; pwsh exposes it via
+          # $LASTEXITCODE (about_Automatic_Variables). Any non-zero
+          # exit (crash, DLL load failure, missing interpreter) now
+          # FAILS the job instead of being logged and ignored.
+          & $bin --help
+          if ($LASTEXITCODE -ne 0) {
+            throw "smoke test failed: $bin --help exited with $LASTEXITCODE"
+          }
+          Write-Host "smoke: $bin --help exited 0"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: hwt-tool-${{ matrix.target }}
-          path: dist/*
+          name: hwt_tool-${{ matrix.target }}
+          path: build/hwt_tool-${{ matrix.target }}*
           if-no-files-found: error
+          retention-days: 14
 
-  # ─────────────────────────────────────────────────────────────────────────
-  # Termux target — Nuitka inside the official Termux Docker image.
-  # continue-on-error: the Termux toolchain drifts often; a failure here must
-  # not block the desktop builds or the release.
-  # ─────────────────────────────────────────────────────────────────────────
-  build-termux:
-    name: build (termux-armv8)
-    runs-on: ubuntu-24.04-arm
-    continue-on-error: true
-    permissions:
-      contents: read
+  # --------------------------------------------------------------------------
+  # Linux x86 (32-bit): runs the build in an i386 container on the regular
+  # x86_64 ubuntu-latest runner (the x86_64 kernel executes 32-bit code
+  # natively, no emulation). jobs.<id>.container CANNOT be used (the runner
+  # mounts only 64-bit node binaries into /__e/ — actions/runner#2115), so
+  # all actions run on the host and the build runs via plain `docker run`
+  # with the workspace bind-mounted (requirements.txt is visible inside
+  # via the bind mount).
+  # --------------------------------------------------------------------------
+  build-linux-x86:
+    name: Build linux-x86 (32-bit)
+    runs-on: ubuntu-latest
+
     steps:
-      - name: Check out the repository
+      - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Fail early if requirements.txt is missing
-        shell: bash
+      - name: Compile with Nuitka (32-bit Linux, inside i386 container)
         run: |
           set -euo pipefail
-          if [ ! -f requirements.txt ]; then
-            echo "::error::requirements.txt is required next to hwt_tool.py (expected content: Pillow)"
-            exit 1
-          fi
+          # NOTE: the workflow-level env block is exported into run-step
+          # shells, so ${PYTHON_VERSION} expands correctly here (host shell).
+          docker run --rm \
+            --platform linux/386 \
+            -e PYTHON_VERSION \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            "python:${PYTHON_VERSION}-slim" \
+            bash -euo pipefail -c '
+              # Pre-built packages only where they exist; everything that
+              # must be built from source (FIX 10) needs its native
+              # SYSTEM headers present (these are OS packages, NOT pip
+              # packages — they cannot live in requirements.txt):
+              #   libffi-dev    — <ffi.h> for cffi (the optional zstandard
+              #                  onefile-compressor chain, FIX 5)
+              #   zlib1g-dev + libjpeg-dev — REQUIRED to build Pillow from
+              #                  the sdist if no cp315 i686 wheel exists:
+              #                  zlib is a hard Pillow dependency; without
+              #                  the headers it dies with
+              #                  "RequiredDependencyException: zlib" (FIX 10).
+              #   make          — gcc LTO needs it for parallel LTRANS linking
+              #                  (Nuitka#3238).
+              apt-get update
+              apt-get install -y --no-install-recommends \
+                gcc g++ make ccache patchelf file libffi-dev \
+                zlib1g-dev libjpeg-dev
+              python --version
+              python -c "import platform; print(\"arch:\", platform.machine())"
+              python -m pip install --upgrade pip
+              # Runtime dependencies from requirements.txt (ALL REQUIRED):
+              # the build FAILS if Pillow cannot be installed. No runtime
+              # package is pinned or hardcoded here — requirements.txt is
+              # the single source of truth.
+              if [ -f requirements.txt ]; then
+                python -m pip install -r requirements.txt
+              else
+                echo "ERROR: requirements.txt not found — cannot build a working binary." >&2
+                exit 1
+              fi
+              # FIX 1: Python 3.12+ images do not bundle setuptools;
+              # Nuitka --include-package=setuptools requires it.
+              python -m pip install --upgrade pip setuptools wheel
+              # Build tooling: Nuitka + onefile compression helpers.
+              python -m pip install --upgrade nuitka ordered-set
+              # zstandard: optional onefile compressor; libffi-dev makes
+              # the source build succeed. If it still fails, continue
+              # WITHOUT it: the payload is packed UNCOMPRESSED.
+              python -m pip install --upgrade zstandard || \
+                echo "WARNING: zstandard install failed — the onefile payload will be uncompressed."
+              # FIX 9: prove pip/setuptools + the runtime dep are
+              # importable; versions come from importlib.metadata, NEVER
+              # from module __version__ attributes.
+              python -c "import pip, setuptools, wheel; from importlib.metadata import version; print(\"pip+setuptools OK\", version(\"pip\"), version(\"setuptools\"))"
+              python -c "import PIL; from importlib.metadata import version; print(\"Pillow\", version(\"Pillow\"))"
+              python -m nuitka \
+                --standalone \
+                --onefile \
+                --lto=yes \
+                --include-package=pip \
+                --include-package=setuptools \
+                --include-package=PIL \
+                --jobs=4 \
+                --output-dir=build \
+                --output-filename="hwt_tool-linux-x86" \
+                --company-name="HWT Tool" \
+                --product-name="HWT Tool" \
+                --file-description="HWT Tool (hwt_tool)" \
+                --file-version="1.0.0.0" \
+                --product-version="1.0.0.0" \
+                --remove-output \
+                --assume-yes-for-downloads \
+                "hwt_tool.py"
+              # Smoke test (FIX 19: FATAL — no || true anymore; see
+              # the matrix-job smoke step). --help works because the
+              # script uses argparse and exits 0; the i386 binary runs
+              # natively on the x86_64 runner kernel. A SIGILL/crash
+              # exits non-zero and FAILS the build under set -e.
+              file build/hwt_tool-linux-x86
+              ./build/hwt_tool-linux-x86 --help
+              echo "smoke: build/hwt_tool-linux-x86 --help exited 0"
+            '
 
-      # FIX: never bind-mount into the Termux container — COPY everything in
-      # via the Dockerfile and copy the result out of the stopped container.
-      - name: Write the Termux build context
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat > Dockerfile <<'EOF'
-          FROM termux/termux-docker:aarch64
-          COPY hwt_tool.py requirements.txt build_termux.sh /build/
-          CMD bash /build/build_termux.sh
-          EOF
-          cat > build_termux.sh <<'EOF'
-          #!/data/data/com.termux/files/usr/bin/bash
-          set -euo pipefail
-          cd "$HOME"
-          cp /build/hwt_tool.py /build/requirements.txt .
-          pkg update -y
-          # Prebuilt Termux packages: building Pillow from source on-device is slow and fragile.
-          pkg install -y python python-pip patchelf ccache binutils ldd termux-elf-cleaner python-pillow libc++
-          export PIP_BREAK_SYSTEM_PACKAGES=1
-          python -m pip install -r requirements.txt
-          python -m pip install nuitka ordered-set
-          PYVER="$(python -c 'import sys; print("{}.{}".format(sys.version_info[0], sys.version_info[1]))')"
-          export CFLAGS="-I$PREFIX/include"
-          # Nuitka links against the Termux Python shared library and libc++_shared.
-          export LDFLAGS="-L$PREFIX/lib -lpython${PYVER} -lc++_shared"
-          python -m nuitka --onefile --standalone --lto=yes --assume-yes-for-downloads --output-dir="$HOME" --output-filename=hwt_tool.bin hwt_tool.py
-          # FIX: the smoke test must exit 0, otherwise the job fails.
-          ./hwt_tool.bin --help
-          echo "termux smoke test passed"
-          EOF
-          chmod +x build_termux.sh
-          echo "build context ready"
-
-      - name: Build the Docker image
-        run: docker build --tag hwt-tool-termux --privileged .
-
-      - name: Run the build and extract the binary
-        run: |
-          set -euo pipefail
-          cid="$(docker create --privileged hwt-tool-termux)"
-          # docker start --attach streams the build log and returns the
-          # container's exit code, so a failed smoke test fails this step.
-          docker start --attach "$cid"
-          mkdir -p dist
-          docker cp "$cid:/data/data/com.termux/files/home/hwt_tool.bin" dist/hwt_tool-termux-armv8
-          docker rm "$cid" >/dev/null
-          ls -l dist
-
-      - name: Upload the artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: hwt-tool-termux-armv8
-          path: dist/*
+          name: hwt_tool-linux-x86
+          path: build/hwt_tool-linux-x86*
           if-no-files-found: error
+          retention-days: 14
 
-  # ─────────────────────────────────────────────────────────────────────────
-  # Release: attach every binary to the GitHub release for a v* tag.
-  # ─────────────────────────────────────────────────────────────────────────
-  release:
-    name: release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, build-termux]
+  # --------------------------------------------------------------------------
+  # TERMUX (Android, Bionic libc) — armv8 + armv9. The binaries are
+  # built INSIDE real Termux: the termux/termux-docker:aarch64
+  # container (the termux/termux-docker project) runs DIRECTLY on the
+  # ARMv9 runner ubuntu-24.04-arm (host aarch64 == container arch, no
+  # emulation needed; termux-docker aarch64 containers sometimes
+  # require privileged mode — hence --privileged).
+  #
+  # Why these are separate binaries: glibc binaries (linux-armv8/armv9)
+  # do NOT run in Termux (the ELF interpreter
+  # /lib/ld-linux-aarch64.so.1 does not exist on Android —
+  # execve() ENOENT; Bionic != glibc). And vice versa — a termux
+  # binary (Bionic, ELF interpreter /system/bin/linker64) will NOT
+  # run on glibc Linux.
+  #
+  # FILE TRANSFER ORDER (FIX 14, 2026-09-25) — WITHOUT bind-mounts:
+  #   INPUT:  docker build bakes hwt_tool.py + requirements.txt
+  #          into an image layer via COPY (the docker client uploads
+  #          the build context to the daemon as a tar stream — the
+  #          host path is not needed by the daemon). In the live run
+  #          2026-09-24/25 in the reference repo the bind-mount
+  #          -v "$GITHUB_WORKSPACE:/src" turned out to be EMPTY
+  #          inside the container (cp /src/mozvpn.py → "No such
+  #          file or directory" while pkg/apt/pip were working), so
+  #          the job no longer relies on host bind mounts at all.
+  #   OUTPUT: the build container is started WITHOUT --rm under the
+  #          fixed name hwt-tool-termux-build; after it finishes, the
+  #          binary is extracted from the STOPPED container with
+  #          docker cp (Docker docs: works with both running and
+  #          stopped containers).
+  #
+  # The dependency installation ORDER matters:
+  #   1. pkg installs the prebuilt Termux packages python, python-pip
+  #      and python-pillow; plus the Nuitka toolchain per the official
+  #      documentation: clang binutils patchelf ccache ldd
+  #      termux-elf-cleaner file, and ALSO make (gcc LTO needs it for
+  #      parallel LTRANS linking, Nuitka#3238). Termux does NOT use
+  #      -dev packages: headers ship inside the packages themselves
+  #      (libjpeg-turbo and zlib come with python-pillow). (The
+  #      reference repo additionally installs python-cryptography
+  #      and cmake+ninja there — for its cryptography and zxing-cpp
+  #      dependencies, which hwt_tool does not have.)
+  #   2. `pip install -r requirements.txt` then sees the `Pillow`
+  #      requirement as already SATISFIED by the prebuilt Termux
+  #      package and does not rebuild it from sdist.
+  #      PIP_BREAK_SYSTEM_PACKAGES=1 bypasses the PEP 668 marker.
+  #      requirements.txt remains the SINGLE source of runtime
+  #      dependencies.
+  #   3. nuitka/ordered-set/zstandard are workflow BUILD tooling,
+  #      not runtime dependencies.
+  #
+  # armv9 variant (FIX 18): MARCH="-mtune=neoverse-n2" in
+  # CFLAGS/LDFLAGS — scheduler TUNING ONLY; the ISA stays ARMv8
+  # baseline, so the binary runs on ALL aarch64 Android devices
+  # (an -march=armv9-a build emits SVE2/LSE instructions that SIGILL
+  # on phones without userspace SVE2 — verified live on a real
+  # device; clang emits SVE unconditionally for Armv9-A per
+  # llvm/llvm-project#114987). armv8 — the plain default baseline.
+  # The build is EXPERIMENTAL: continue-on-error: true — a Termux job
+  # failure must not block the release of the other targets.
+  # --------------------------------------------------------------------------
+  build-termux:
+    name: Build termux-${{ matrix.target }} (Bionic, Android)
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: armv8
+            march: ""
+          - target: armv9
+            march: "-mtune=neoverse-n2"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Compile with Nuitka (inside Termux container)
+        run: |
+          set -euo pipefail
+          mkdir -p termux-out
+          # -----------------------------------------------------------------
+          # FIX 14 (2026-09-25): do NOT rely on bind-mounts at all.
+          #
+          # 1) INPUT via an image layer: the sources are baked into
+          #    the image by docker build with COPY. The build context
+          #    (the $GITHUB_WORKSPACE directory) is sent by the docker
+          #    CLIENT to the daemon as a tar stream — the host path
+          #    does NOT have to be visible to the daemon (unlike a
+          #    -v bind mount). An empty checkout now fails the step
+          #    IMMEDIATELY with a clear COPY error, not after
+          #    15 minutes of package installation.
+          # 2) OUTPUT via docker cp: the build container runs in the
+          #    foreground WITHOUT --rm under the name
+          #    hwt-tool-termux-build; when it finishes (exit code =
+          #    step exit code), the binary is extracted from the
+          #    STOPPED container (docker cp officially supports
+          #    stopped containers), after which the container is
+          #    removed.
+          # -----------------------------------------------------------------
+          cat > termux-builder.Dockerfile <<'DOCKERFILE'
+          FROM termux/termux-docker:aarch64
+          COPY hwt_tool.py requirements.txt /src/
+          DOCKERFILE
+          docker build -t hwt-tool-termux-builder -f termux-builder.Dockerfile "$GITHUB_WORKSPACE"
+          docker run \
+            --privileged \
+            --name hwt-tool-termux-build \
+            hwt-tool-termux-builder \
+            bash -euo pipefail -c '
+              set -euo pipefail
+              # NOTE: termux-docker entrypoint passes COMMAND-LINE ARGUMENTS
+              # into the Termux environment (through a privilege-dropping su,
+              # UID 1000) — Docker `-e` env vars do NOT survive into it.
+              # The two GitHub Actions expression substitutions below are
+              # replaced BEFORE the shell runs, so the inner script sees
+              # plain literals (never write a bare expression placeholder in
+              # a comment: the workflow parser evaluates every expression
+              # token in the whole file, comments inside run: included).
+              TARGET="${{ matrix.target }}"
+              MARCH="${{ matrix.march }}"
+              export PIP_BREAK_SYSTEM_PACKAGES=1
+              echo "=== Termux arch: $(uname -m) | target: ${TARGET} | march: [${MARCH}]"
+              pkg update -y || true
+              pkg install -y \
+                python python-pip \
+                python-pillow \
+                libc++ \
+                clang binutils patchelf ccache ldd termux-elf-cleaner \
+                pkg-config libjpeg-turbo zlib file make
+              # The sources come from the IMAGE LAYER baked by docker build
+              # (COPY hwt_tool.py requirements.txt /src/ — FIX 14), not
+              # from a host bind mount. COPY files are root:root 0644 —
+              # readable by the `system` user. We copy them INSIDE the
+              # Termux prefix: Android disallows exec from external mounted
+              # paths, and Nuitka compiles and runs intermediate binaries
+              # in its output-dir.
+              mkdir -p "$HOME/hwt_tool"
+              cp /src/hwt_tool.py /src/requirements.txt "$HOME/hwt_tool"/
+              cd "$HOME/hwt_tool"
+              export PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+              # FIX 15: Android linker64 resolves dlopen symbols STRICTLY —
+              # a Python extension built WITHOUT linking against libpython
+              # fails to import with "cannot locate symbol PyTuple_Type"
+              # (the reference repo hit this at the zxing-cpp stubgen step;
+              # same failure class as numpy/dlib in Termux). The official
+              # Termux numpy instructions use the same workaround:
+              # LDFLAGS="-lpython3.X". PYVER is derived from the
+              # interpreter itself so the libpython name follows the Python
+              # major.minor without hardcoding. hwt_tool has exactly one
+              # binary extension — PIL._imaging — and this flag keeps it
+              # importable on Android.
+              # FIX 17 (libc++_shared): Python extension modules are linked
+              # with the C driver (CC = clang), which does NOT add the C++
+              # standard library — while glibc would resolve leftover
+              # undefined C++ symbols through the main application at
+              # dlopen, the Android linker requires EVERY symbol to be
+              # resolvable, so an extension that needs libc++ must link
+              # against libc++_shared explicitly. Termux ships
+              # libc++_shared.so in $PREFIX/lib (package libc++; the
+              # libc++.so linker script INPUTs -lc++_shared as the fake
+              # libstdc++), and the rpath below lets dlopen find it at load
+              # time. hwt_tool itself has no C++ extension today, but the
+              # flag is kept for the moment one enters the set — it is
+              # harmless otherwise.
+              # NOTE: no single-quote characters in this comment or
+              # code (FIX 16 rule).
+              # FIX 16 (bash quoting, 2026-09-25): this whole inner
+              # script is the single-quoted argument passed to
+              # bash -euo pipefail -c — the FIRST single-quote
+              # character anywhere in the body TERMINATES the outer
+              # string early, and the runner shell dies with a syntax
+              # error near an unexpected token (live run in the
+              # reference repo, 2026-09-25, exit 2 BEFORE docker build
+              # started). RULE: NO single-quote characters anywhere in
+              # this script body, not even inside comments. The dot
+              # below is chr(46) so the python -c code needs NO inner
+              # quotes at all; the nested double quotes are legal
+              # because inside double-quoted command substitution
+              # the quoting restarts fresh.
+              PYVER="$(python -c "import sys; print(str(sys.version_info[0]) + chr(46) + str(sys.version_info[1]))")"
+              echo "=== linking extensions against libpython${PYVER} (FIX 15)"
+              export CFLAGS="-I${PREFIX}/include ${MARCH}"
+              export CXXFLAGS="-I${PREFIX}/include ${MARCH}"
+              export LDFLAGS="-L${PREFIX}/lib -Wl,-rpath,${PREFIX}/lib -lpython${PYVER} -lc++_shared ${MARCH}"
+              python --version
+              python -c "import platform; print(\"arch:\", platform.machine())"
+              # NOTE (FIX 12): `pip install --upgrade pip` is FORBIDDEN in
+              # Termux ("ERROR: Installing pip is forbidden, this will
+              # break the python-pip package (termux)") — Termux ships a
+              # PATCHED pip; the ONLY way to upgrade it is
+              # `pkg upgrade python-pip`. setuptools/wheel upgrades via
+              # pip ARE allowed and needed for
+              # Nuitka --include-package=setuptools (FIX 1).
+              python -m pip install --upgrade setuptools wheel
+              # Runtime dependencies: requirements.txt is the single source
+              # of truth. Pillow is already satisfied by the prebuilt
+              # Termux package (python-pillow), pip does not touch it.
+              if [ -f requirements.txt ]; then
+                python -m pip install -r requirements.txt
+              else
+                echo "ERROR: requirements.txt not found — cannot build a working binary." >&2
+                exit 1
+              fi
+              # Build tooling: Nuitka + onefile compression helpers.
+              python -m pip install --upgrade nuitka ordered-set
+              python -m pip install --upgrade zstandard || \
+                echo "WARNING: zstandard install failed — the onefile payload will be uncompressed."
+              # FIX 9: versions ONLY via importlib.metadata.
+              python -c "import pip, setuptools, wheel; from importlib.metadata import version; print(\"pip+setuptools OK\", version(\"pip\"), version(\"setuptools\"))"
+              python -c "import PIL; from importlib.metadata import version; print(\"Pillow\", version(\"Pillow\"))"
+              python -m nuitka --version
+              # Nuitka build INSIDE Termux (officially supported: the
+              # documentation requires patchelf/ccache/binutils/ldd/
+              # termux-elf-cleaner; standalone rpath for Termux was fixed
+              # in Nuitka 2.6.7/2.7). termux-elf-cleaner is installed
+              # alongside; Nuitka calls it on the produced binary and it
+              # strips the ELF versions the Android linker64 does not
+              # support.
+              python -m nuitka \
+                --standalone \
+                --onefile \
+                --lto=yes \
+                --include-package=pip \
+                --include-package=setuptools \
+                --include-package=PIL \
+                --clang \
+                --jobs=4 \
+                --output-dir=build \
+                --output-filename="hwt_tool-termux-${TARGET}" \
+                --company-name="HWT Tool" \
+                --product-name="HWT Tool" \
+                --file-description="HWT Tool (hwt_tool, Termux/Android Bionic)" \
+                --file-version="1.0.0.0" \
+                --product-version="1.0.0.0" \
+                --remove-output \
+                --assume-yes-for-downloads \
+                "hwt_tool.py"
+              # Smoke test inside the real Termux (FIX 19: FATAL —
+              # no || true anymore; see the matrix-job smoke step).
+              # The binary is Bionic and runs right here on the
+              # aarch64 host; --help exits 0 via argparse. A SIGILL
+              # (like the FIX 18 armv9 incident) exits non-zero
+              # (128+4=132) and FAILS the build under set -e — a
+              # broken binary can no longer ship unnoticed.
+              file build/hwt_tool-termux-"${TARGET}"
+              ./build/hwt_tool-termux-"${TARGET}" --help
+              echo "smoke: termux ${TARGET} --help exited 0"
+              # NOTE: the binary is NOT copied out through a bind mount
+              # anymore (FIX 14). The host extracts it from the stopped
+              # container via `docker cp` (see below).
+            '
+          # The build container has exited now (non-zero exit would have
+          # failed the step above). Extract the binary from the STOPPED
+          # container — docker cp officially works with stopped containers,
+          # and no host path is ever mounted.
+          docker cp \
+            hwt-tool-termux-build:/data/data/com.termux/files/home/hwt_tool/build/hwt_tool-termux-${{ matrix.target }} \
+            termux-out/
+          docker rm hwt-tool-termux-build
+
+      - name: Verify binary was produced
+        run: |
+          set -euo pipefail
+          ls -la termux-out
+          test -f termux-out/hwt_tool-termux-${{ matrix.target }}
+          file termux-out/hwt_tool-termux-${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: hwt_tool-termux-${{ matrix.target }}
+          path: termux-out/hwt_tool-termux-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # --------------------------------------------------------------------------
+  # Release: downloads ALL build artifacts into one folder and attaches
+  # every binary to the GitHub Release as a SEPARATE asset — NO zip
+  # (FIX 8). Runs for v* tags, release/** tags, or a published GitHub
+  # Release. Built only when all `needs` jobs succeeded (no `always()`);
+  # the Termux jobs are continue-on-error, so a failed EXPERIMENTAL
+  # Termux build does not block the release of the stable targets.
+  #
+  # Per GitHub's release-assets documentation, asset names must be unique
+  # within a release — the unified target naming (one file per OS/arch,
+  # hwt_tool-<target>[.exe]) guarantees that.
+  # softprops/action-gh-release attaches each matched file as its own
+  # asset and supports glob patterns in `files`.
+  # --------------------------------------------------------------------------
+  release-bundle:
+    name: Attach binaries to release
+    needs: [build, build-linux-x86, build-termux]
+    if: >
+      startsWith(github.ref, 'refs/tags/v') ||
+      startsWith(github.ref, 'refs/tags/release/') ||
+      github.event_name == 'release'
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+
     steps:
-      - name: Download all build artifacts
+      # Download all build artifacts into the SAME folder (merge-multiple:
+      # true) so every binary lands side by side as dist/hwt_tool-<target>.
+      - name: Download all artifacts
         uses: actions/download-artifact@v8
         with:
-          pattern: hwt-tool-*
-          merge-multiple: true
           path: dist
+          merge-multiple: true
 
-      - name: Attach binaries to the release
+      - name: Verify binaries
+        run: |
+          set -euo pipefail
+          ls -laR dist
+          if ! ls dist/hwt_tool-* >/dev/null 2>&1; then
+            echo "ERROR: no binaries found in dist/ — nothing to attach to the release" >&2
+            exit 1
+          fi
+          echo "Binaries to attach as individual release assets:"
+          ls -1 dist/hwt_tool-*
+
+      # Each file matching the glob becomes its OWN release asset:
+      # hwt_tool-linux-x86_64, hwt_tool-linux-armv8,
+      # hwt_tool-linux-armv9, hwt_tool-linux-x86,
+      # hwt_tool-termux-armv8, hwt_tool-termux-armv9,
+      # hwt_tool-windows-x86_64.exe, hwt_tool-windows-x86.exe,
+      # hwt_tool-windows-arm64.exe — no zip is created anywhere.
+      - name: Attach binaries to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/*
+          files: dist/hwt_tool-*
           generate_release_notes: true
