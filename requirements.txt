@@ -31,7 +31,7 @@
 #     tobytes / save), all available since long before 10.4.
 #
 # TERMUX (Android): PyPI has no Termux wheels, so pip would otherwise try
-#   a C build from the sdist. Instead the workflow (build_termux.sh)
+#   a C build from the sdist. Instead the workflow (the build-termux job)
 #   installs Termux's own prebuilt `python-pillow` package via pkg BEFORE
 #   `pip install -r requirements.txt` (with PIP_BREAK_SYSTEM_PACKAGES=1);
 #   pip then sees the requirement already satisfied and never builds it.
