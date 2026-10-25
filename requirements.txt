@@ -1,0 +1,42 @@
+# ============================================================================
+# hwt_tool.py — RUNTIME dependencies.
+#
+# This is THE single source of truth for the script's runtime deps; the
+# CI workflow (release.yml) only runs `pip install -r requirements.txt`
+# and FAILS if it cannot be satisfied — nothing runtime-related is
+# pinned or hardcoded in the workflow (PyInstaller and Nuitka are
+# build-time tools and therefore stay in the workflow, not here).
+#
+# Direct runtime deps of hwt_tool.py:
+#   Pillow — opening/saving the PNGs decoded from com.huawei.watchface
+#            (REQUIRED for watch-face image unpack/pack; ZIP-level
+#            unpack/pack and the info command work without it, and the
+#            script offers to install it at startup when it is missing)
+#
+# Verified on 2026-10-25 against PyPI (facts checked, not assumed):
+#   * Pillow 13.0.0 is the current release (published 2026-10-16) and
+#     requires Python >=3.11; it declares support for CPython 3.11–3.15.
+#   * It ships prebuilt wheels for every build target of this project,
+#     so NO version pin and NO PEP 508 platform marker are needed
+#     (unlike cryptography in the reference free-mozilla-vpn repo, which
+#     had to be pinned to 46.0.3 for win32/win_arm64):
+#       – Windows: win32, win_amd64 and win_arm64 wheels exist for every
+#         supported CPython, cp311 through cp315, including the
+#         free-threading builds (e.g. pillow-13.0.0-cp315-cp315-win_arm64.whl);
+#       – Linux: manylinux and musllinux wheels for x86_64 and aarch64;
+#       – macOS: x86_64 and arm64 wheels.
+#   * The dependency is left unpinned: pip resolves the latest release
+#     automatically, and every release line >=10.4 covers the small API
+#     surface used by hwt_tool.py (Image.frombytes / open / convert /
+#     tobytes / save), all available since long before 10.4.
+#
+# TERMUX (Android): PyPI has no Termux wheels, so pip would otherwise try
+#   a C build from the sdist. Instead the workflow (build_termux.sh)
+#   installs Termux's own prebuilt `python-pillow` package via pkg BEFORE
+#   `pip install -r requirements.txt` (with PIP_BREAK_SYSTEM_PACKAGES=1);
+#   pip then sees the requirement already satisfied and never builds it.
+#   The script itself repeats the same trick on-device (`pkg install
+#   python-pillow`) when it offers to install dependencies at startup.
+# ============================================================================
+
+Pillow
