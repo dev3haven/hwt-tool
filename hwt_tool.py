@@ -1165,7 +1165,7 @@ def file_list_menu(files):
     total_pages = max(1, (len(files) + PAGE_SIZE - 1) // PAGE_SIZE)
     while True:
         print()
-        print(c(tr("found_n", n=len(files)), "bold")
+        print(c(tr("found_n", n=len(files)), "bold"))
         start = page * PAGE_SIZE
         for i, f in enumerate(files[start:start + PAGE_SIZE]):
             try:
